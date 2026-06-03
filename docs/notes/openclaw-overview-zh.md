@@ -56,6 +56,215 @@
 - **工具层**：为 Agent 提供操作能力（执行命令、浏览网页、文件操作等）
 - **插件系统**：可扩展的注册机制，支持添加新渠道、提供商、工具
 
+### 端到端流程图
+
+上面的 ASCII 图描述的是**静态分层**。下面用 mermaid 补一套**动态流程图**（共 8 张），覆盖从"用户在聊天工具发消息"到"AI 回复发回聊天工具"的完整链路，以及渠道接入、Agent 循环、多代理路由、会话压缩、工具审批、设备配对等关键子流程。图中标注的函数/路径均为真实源码锚点。
+
+#### 1. 数据流总览
+
+一条消息进出 OpenClaw 的整体数据流（动态视角，区别于上面的静态分层图）：
+
+```mermaid
+flowchart LR
+    U["用户<br/>(任意聊天 App)"] -->|"inbound"| CH["渠道插件<br/>收消息并规范化"]
+    CH --> SEC["安全门控<br/>allowlist / 配对 / 群聊@提及"]
+    SEC --> ROUTE["路由与绑定<br/>bindings: channel+peer 映射 agentId"]
+    ROUTE --> SESS["会话<br/>session store + 历史 + 压缩"]
+    SESS --> AGENT["Agent 运行循环<br/>prompt -> 模型 -> 工具 -> 回灌"]
+    AGENT --> MODEL["模型提供商<br/>(可故障转移)"]
+    AGENT --> TOOLS["工具<br/>exec/browser/web/file/image/memory ..."]
+    AGENT -->|"最终回复"| OUT["出站路由<br/>routeReply"]
+    OUT -->|"outbound"| CH
+    CH -->|"分块/线程/媒体"| U
+    PLUG["插件注册表<br/>channel/provider/tool capability"] -.->|"注册"| CH
+    PLUG -.->|"注册"| MODEL
+    PLUG -.->|"注册"| TOOLS
+```
+
+> 源码锚点：入站 `src/auto-reply/dispatch.ts`（`dispatchInboundMessage`）；出站 `src/auto-reply/reply/route-reply.ts`（`routeReply` 经 `getLoadedChannelPlugin` 找到渠道插件的 outbound 适配器）。
+
+#### 2. 消息端到端时序
+
+一次完整问答的时序，包含门控分支与 Agent 内部循环：
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant U as 用户
+    participant P as 渠道插件
+    participant D as 入站分发
+    participant G as 安全门控
+    participant R as 回复编排
+    participant A as Agent运行
+    participant M as 模型与工具
+    participant O as 出站路由
+
+    U->>P: 发送消息 (文本 / 媒体)
+    P->>D: 规范化为统一上下文 MsgContext
+    D->>G: 校验发送者 / 配对 / 是否@提及
+    alt 未通过门控
+        G-->>P: 丢弃 / 回配对码 / 仅作群聊静默上下文
+        P-->>U: (无回复或回配对提示)
+    else 通过门控
+        G->>R: finalizeInboundContext + 选定会话 (getReplyFromConfig)
+        R->>A: 装配 prompt (系统 + 记忆 + 技能 + 历史)
+        loop Agent 运行循环
+            A->>M: 调用模型
+            M-->>A: 文本 或 工具调用
+            A->>M: 执行工具 (必要时审批) 并回灌结果
+        end
+        A-->>R: 最终回复 payload
+        R->>O: routeReply (channel, to, accountId)
+        O->>P: 调用插件 outbound 适配器
+        P-->>U: 发送回复 (分块 / 线程 / 媒体)
+    end
+```
+
+> 源码锚点：`getReplyFromConfig`（`src/auto-reply/reply/get-reply.ts`）→ `runReplyAgent`（`src/auto-reply/reply/agent-runner.ts`）→ `runAgentTurnWithFallback`（`src/auto-reply/reply/agent-runner-execution.ts`）→ `runAgentAttempt`（`src/agents/command/attempt-execution.ts`）；渠道回合装配见 `src/channels/turn/kernel.ts`。
+
+#### 3. 渠道接入与插件生命周期
+
+从安装一个聊天渠道插件，到它真正开始收发消息（以微信、Telegram、Google Chat 等不同登录方式为例）：
+
+```mermaid
+flowchart TD
+    I["openclaw plugins install<br/>(如 @tencent-weixin/openclaw-weixin)"] --> DISC["发现 manifest<br/>openclaw.plugin.json + package.json 的 openclaw 块"]
+    DISC --> EN{"已启用且校验通过?<br/>plugins.entries.&lt;id&gt;.enabled"}
+    EN -->|"否"| OFF["仅用于 setup / 状态展示<br/>不启动运行时"]
+    EN -->|"是"| LOAD["加载入口 register(api)<br/>注册 channel capability"]
+    LOAD --> AUTH{"如何认证 / 登录?"}
+    AUTH -->|"扫码类<br/>微信 / WhatsApp / Zalo 个人号"| QR["openclaw channels login<br/>手机扫码, 凭据存本地 state"]
+    AUTH -->|"Token / AppKey 类<br/>Telegram / Slack / 元宝"| TOK["写入 token 或 appKey:appSecret"]
+    AUTH -->|"Webhook 类<br/>Google Chat / LINE / Synology"| WH["注册 HTTP 路由 + 校验签名"]
+    QR --> START["Gateway 启动渠道 monitor<br/>轮询 / 长连接 / webhook 监听"]
+    TOK --> START
+    WH --> START
+    START --> IO["持续收发消息<br/>inbound 规范化 + outbound 适配"]
+```
+
+> 源码锚点：插件发现/加载见 `docs/plugins/architecture.md`；渠道插件职责契约见 `docs/plugins/sdk-channel-plugins.md`；官方/外部渠道目录见 `scripts/lib/official-external-channel-catalog.json`；bundled 入口示例见 `extensions/telegram/index.ts`。
+
+#### 4. Agent 运行循环（model loop）
+
+Agent 不是"一问一答"，而是"推理 → 工具调用 → 回灌 → 再推理"的循环，直到产出最终文本：
+
+```mermaid
+flowchart TD
+    S["开始一轮 (runAgentAttempt)"] --> P["装配 Prompt<br/>系统提示 + MEMORY.md + 每日笔记 + 技能 + 历史"]
+    P --> CALL["调用模型 (失败可故障转移 failover)"]
+    CALL --> DEC{"模型输出?"}
+    DEC -->|"工具调用"| TOOL["解析工具<br/>exec / browser / web_search / file / image / message ..."]
+    TOOL --> APPR{"敏感操作需审批?"}
+    APPR -->|"否"| RUN["执行工具<br/>sandbox / gateway / node"]
+    APPR -->|"是"| WAIT["发审批请求, 等待批准 / 拒绝"]
+    WAIT -->|"批准"| RUN
+    WAIT -->|"拒绝"| FEED["把结果 / 拒绝回灌进上下文"]
+    RUN --> FEED
+    FEED --> BUDGET{"上下文将超预算?"}
+    BUDGET -->|"是"| COMPACT["压缩 compaction<br/>压缩前 memory flush 落盘"]
+    COMPACT --> CALL
+    BUDGET -->|"否"| CALL
+    DEC -->|"最终文本"| OUT["产出回复 payload -> 进入出站"]
+```
+
+> 源码锚点：`src/agents/command/attempt-execution.ts`（`runAgentAttempt`）；工具发送回渠道走核心共享的 `message` 工具，见 `docs/plugins/sdk-channel-plugins.md`。
+
+#### 5. 多 Agent 路由（bindings）
+
+一个 Gateway 可隔离运行多个 Agent，入站消息按 `bindings` 规则路由到不同 Agent（各自独立 workspace / session / auth / skills）：
+
+```mermaid
+flowchart LR
+    IN["入站消息<br/>{channel, peer:{kind,id}, accountId}"] --> MATCH{"匹配 bindings 规则?"}
+    MATCH -->|"命中 agent-a"| A1["Agent A<br/>独立 workspace/session/auth/skills"]
+    MATCH -->|"命中 agent-b"| A2["Agent B<br/>独立 workspace/session/auth/skills"]
+    MATCH -->|"无命中"| DEF["默认 Agent (main)"]
+    A1 --> RUN["进入该 Agent 的运行循环 (见图 4)"]
+    A2 --> RUN
+    DEF --> RUN
+```
+
+> 源码锚点：路由匹配 `match.channel` / `match.peer.kind` / `match.peer.id`，配置示例见 `docs/channels/yuanbao.md` 的"多 Agent 路由"一节与 `docs/channels/channel-routing.md`。
+
+#### 6. 会话压缩 compaction 生命周期
+
+长对话接近模型上下文上限时，OpenClaw 会把旧回合摘要成 compact entry；压缩前先静默把要点落盘到记忆文件，避免上下文丢失：
+
+```mermaid
+flowchart TD
+    START["一轮回复开始 / agent_end 后检查"] --> TRIG{"触发压缩?"}
+    TRIG -->|"token 接近上限<br/>(window - reserve - soft)"| FLUSH
+    TRIG -->|"transcript 字节超限<br/>maxActiveTranscriptBytes"| FLUSH
+    TRIG -->|"模型返回上下文溢出错误"| OVF["overflow 路径<br/>压缩后自动重试"]
+    TRIG -->|"手动 /compact [指令]"| FLUSH
+    TRIG -->|"未达阈值"| SKIP["跳过, 正常运行模型"]
+    OVF --> FLUSH["压缩前: 静默 memory flush<br/>要点写入 MEMORY.md / 每日笔记 (可用独立模型)"]
+    FLUSH --> SUM["摘要旧回合 -> compact entry<br/>保留最近消息 + 保持 tool/result 配对"]
+    SUM --> ROT{"truncateAfterCompaction?"}
+    ROT -->|"是"| SUCC["生成后继 transcript<br/>摘要 + 保留状态 + 未摘要尾部, 原文归档"]
+    ROT -->|"否"| INPLACE["仅改模型下一轮所见<br/>完整历史仍在磁盘"]
+    SUCC --> DONE["compactionCount++ ; 可选 notifyUser 🧹<br/>overflow 路径在此自动重试"]
+    INPLACE --> DONE
+```
+
+> 源码锚点：`src/auto-reply/reply/agent-runner-memory.ts`（`runPreflightCompactionIfNeeded` + `runMemoryFlushIfNeeded`）、`src/agents/sessions/agent-session.ts`（`checkCompaction`：overflow 自动重试 / threshold 不重试）；配置见 `docs/concepts/compaction.md` 的 `agents.defaults.compaction.*`。
+
+#### 7. 工具审批流（exec approval）
+
+Agent 在真实主机（gateway / node）执行命令受"工具策略 + 白名单 +（可选）人工审批"三重门控；沙箱执行不走主机审批：
+
+```mermaid
+flowchart TD
+    EX["Agent 调用 exec 工具"] --> HOST{"执行 host?"}
+    HOST -->|"sandbox 沙箱"| SBX["沙箱内直接运行<br/>(不走主机审批)"]
+    HOST -->|"gateway / node 主机"| POL["计算有效策略<br/>取 tools.exec.* 与主机 approvals 文件中更严格者"]
+    POL --> MODE{"mode / security + ask"}
+    MODE -->|"full + ask=off (YOLO)"| RUN["在主机执行命令"]
+    MODE -->|"allowlist 命中 (ask=on-miss)"| RUN
+    MODE -->|"deny"| BLOCK["拒绝: 命令不运行"]
+    MODE -->|"需要审批 (ask 命中)"| REQ["两阶段注册审批请求<br/>先注册 ID, 再返回 approval-pending"]
+    REQ --> AUTO{"mode = auto?"}
+    AUTO -->|"是"| REV["先过原生 auto reviewer"]
+    AUTO -->|"否"| BCAST["广播 exec.approval.requested<br/>到 Control UI / macOS app / 原生聊天客户端"]
+    REV --> BCAST
+    BCAST --> WAIT{"用户决策 (或超时)"}
+    WAIT -->|"✅ 允许一次"| RESOLVE["exec.approval.resolve"]
+    WAIT -->|"♾️ 永久允许"| ALLOWALL["写入 allowlist 持久信任"]
+    WAIT -->|"❌ 拒绝 / 超时 / UI 不可达 (askFallback=deny)"| BLOCK
+    ALLOWALL --> RESOLVE
+    RESOLVE --> FWD["gateway 转发到执行 host<br/>host=node 用 canonical systemRunPlan"]
+    FWD --> RUN
+    RUN --> EVT["发系统事件: Exec running / finished"]
+    BLOCK --> DENY["denial 回灌 session (终态, fail-closed)"]
+```
+
+> 源码锚点：`src/agents/bash-tools.exec.ts`（`createExecTool` 解析 host/security/ask）、`src/gateway/server-methods/exec-approval.ts`（两阶段注册 + 广播）、`src/infra/exec-approval-channel-runtime.ts`（渠道原生审批投递）；策略说明见 `docs/tools/exec-approvals.md`。
+
+#### 8. 设备 / 节点配对（pairing）
+
+OpenClaw 有两条配对轨：**设备配对**（客户端如 iOS/Android/macOS/Control UI 连接 Gateway）与**节点配对**（提供命令执行能力的节点）。注意这与图 2 里的"聊天渠道 DM 配对"是不同的东西：
+
+```mermaid
+flowchart TD
+    CONN["设备 / 节点连接 Gateway (WS connect)"] --> KIND{"连接类型?"}
+    KIND -->|"客户端设备<br/>iOS / Android / macOS / Control UI / WebChat"| DEV["设备配对 (role: operator 或 node)"]
+    KIND -->|"命令执行节点<br/>声明 caps / commands / permissions"| NODE["节点配对 node.pair.*"]
+    DEV --> DPAIR{"已配对?"}
+    DPAIR -->|"是"| DOK["按已颁发 token + role/scope 接入"]
+    DPAIR -->|"否"| DPEND["创建 pending<br/>广播 device.pair.requested"]
+    DPEND --> DAUTO{"可自动批准?<br/>受信 CIDR / silent bootstrap / 元数据升级"}
+    DAUTO -->|"否"| DOP["操作员批准<br/>openclaw devices approve &lt;requestId&gt;"]
+    DAUTO -->|"是"| DAPV["device.pair.approve<br/>颁发按 role/scope 的 token"]
+    DOP --> DAPV
+    DAPV --> DOK
+    NODE --> NPEND["存 pending + 广播 node.pair.requested<br/>5 分钟过期; 命令在批准前禁用"]
+    NPEND --> NOP["操作员批准<br/>openclaw nodes approve &lt;requestId&gt;"]
+    NOP --> NAPV["node.pair.approve<br/>颁发新 token (每次重配对轮转) + 命令白名单"]
+    NAPV --> NRUN["节点用 token 重连, 命令可用<br/>exec host=node 再受节点 exec.approvals 约束"]
+```
+
+> 源码锚点：设备配对 `src/infra/device-pairing.ts`（`approveDevicePairing`）+ `src/gateway/server-methods/devices.ts`；节点配对 `src/infra/node-pairing.ts`（`approveNodePairing`）+ `src/gateway/node-connect-reconcile.ts`（`reconcileNodePairingOnConnect`）；流程说明见 `docs/gateway/pairing.md`。
+
 ---
 
 ## 三、安装与使用
